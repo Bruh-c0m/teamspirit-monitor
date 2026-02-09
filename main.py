@@ -2,31 +2,11 @@
 import os
 import time
 import asyncio
-import sys
-import subprocess
 from dotenv import load_dotenv
 from telegram import Bot
 from telegram.error import TelegramError
 from playwright.async_api import async_playwright
 
-# === УСТАНОВКА CHROMIUM ПРИ СТАРТЕ (если отсутствует) ===
-def install_chromium_if_needed():
-    """Проверяет наличие Chromium и устанавливает при необходимости"""
-    try:
-        from playwright.sync_api import sync_playwright
-        with sync_playwright() as p:
-            executable_path = p.chromium.executable_path  # это строка
-            if not os.path.exists(executable_path):
-                raise FileNotFoundError("Chromium executable not found")
-    except (ImportError, FileNotFoundError):
-        print("📦 Chromium не найден. Устанавливаем...")
-        subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=True)
-        print("✅ Chromium установлен!")
-
-# Запускаем установку ДО всего остального
-install_chromium_if_needed()
-
-# === ОСТАЛЬНОЙ КОД БЕЗ ИЗМЕНЕНИЙ ===
 load_dotenv()
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
 CHAT_ID = os.getenv('CHAT_ID')
@@ -39,14 +19,24 @@ except (ValueError, TypeError):
     exit(1)
 
 async def check_with_playwright():
+    """Проверяет наличие товара через Playwright с флагами для Railway"""
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
+        browser = await p.chromium.launch(
+            headless=True,
+            args=[
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-dev-shm-usage',
+                '--disable-gpu',
+                '--single-process'
+            ]
+        )
         page = await browser.new_page()
         try:
             url = f"https://shop.teamspirit.gg/ru/products/{PRODUCT_ID}"
             print(f"🌐 Открываем страницу: {url}")
             await page.goto(url, wait_until='networkidle', timeout=30000)
-            await page.wait_for_timeout(3000)
+            await page.wait_for_timeout(2000)
 
             main_button = await page.query_selector('button.btn-lg')
             if not main_button:
@@ -57,12 +47,15 @@ async def check_with_playwright():
             is_disabled = await main_button.get_attribute('disabled')
             print(f"📌 Текст кнопки: '{button_text}' | disabled: {is_disabled}")
 
+            # Явное отсутствие
             if any(txt in button_text for txt in ["Нет в наличии", "Not available", "Out of stock"]):
                 return False
 
+            # Проверка размеров
             if "Выберите размер" in button_text or "Select size" in button_text:
                 return await check_sizes_availability(page)
 
+            # Обычная доступность
             return not is_disabled
 
         except Exception as e:
@@ -72,6 +65,7 @@ async def check_with_playwright():
             await browser.close()
 
 async def check_sizes_availability(page):
+    """Проверяет доступные размеры"""
     try:
         sizes_container = (
             await page.query_selector('div.purchase-card__sizes') or
@@ -93,6 +87,7 @@ async def check_sizes_availability(page):
         return False
 
 async def send_telegram_message(message_text):
+    """Отправляет сообщение в Telegram"""
     try:
         bot = Bot(token=TELEGRAM_TOKEN)
         await bot.send_message(chat_id=CHAT_ID, text=message_text, parse_mode='Markdown')
@@ -180,5 +175,4 @@ if __name__ == '__main__':
         print(f"❌ Отсутствуют переменные: {', '.join(missing_vars)}")
         exit(1)
 
-    # УБРАНО: quick_test() и input() — они не работают в Railway!
     main()
