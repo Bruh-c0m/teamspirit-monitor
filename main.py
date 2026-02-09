@@ -2,40 +2,48 @@
 import os
 import time
 import asyncio
-from datetime import datetime
+import sys
+import subprocess
 from dotenv import load_dotenv
-from telegram import BotCommand, Update
-from telegram.ext import Application, CommandHandler, ContextTypes
-from playwright.async_api import async_playwright, Error as PlaywrightError
-import httpx
+from telegram import Bot
+from telegram.error import TelegramError
+from playwright.async_api import async_playwright
 
+# Установка Chromium при старте (если отсутствует)
+def install_chromium():
+    try:
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as p:
+            if not p.chromium.executable_path.exists():
+                raise FileNotFoundError()
+    except (ImportError, FileNotFoundError):
+        print("📦 Устанавливаем Chromium для Playwright...")
+        subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=True)
+
+install_chromium()
+
+# Загрузка переменных
 load_dotenv()
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
 CHAT_ID = os.getenv('CHAT_ID')
 PRODUCT_ID = os.getenv('PRODUCT_ID')
 
+# Проверка CHAT_ID
 try:
     CHAT_ID = int(CHAT_ID)
 except (ValueError, TypeError):
     print("❌ Ошибка: CHAT_ID должен быть числом!")
     exit(1)
 
-# Глобальные переменные состояния
-last_check_time: datetime | None = None
-last_check_result: bool | None = None  # True = доступен, False = нет, None = ошибка
-
 async def check_with_playwright():
-    """Проверяет наличие товара через Playwright"""
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         page = await browser.new_page()
-
         try:
-            # 🔥 ИСПРАВЛЕНО: убраны лишние пробелы в URL
             url = f"https://shop.teamspirit.gg/ru/products/{PRODUCT_ID}"
             print(f"🌐 Открываем страницу: {url}")
             await page.goto(url, wait_until='networkidle', timeout=30000)
-            await page.wait_for_timeout(2000)
+            await page.wait_for_timeout(3000)
 
             main_button = await page.query_selector('button.btn-lg')
             if not main_button:
@@ -76,127 +84,95 @@ async def check_with_playwright():
         finally:
             await browser.close()
 
-async def safe_check_with_retry(max_retries=3, delay=30):
-    """Безопасная проверка с повторами при сетевых ошибках"""
-    for attempt in range(1, max_retries + 1):
-        try:
-            result = await check_with_playwright()
-            return result
-        except (PlaywrightError, httpx.ConnectError, OSError) as e:
-            print(f"⚠️ Сетевая ошибка (попытка {attempt}/{max_retries}): {e}")
-            if attempt < max_retries:
-                await asyncio.sleep(delay)
-            else:
-                print("   ❌ Все попытки исчерпаны.")
-                return None
-        except Exception as e:
-            print(f"💥 Неожиданная ошибка: {e}")
-            return False
-    return None
-
-async def send_notification(context: ContextTypes.DEFAULT_TYPE):
-    detection_time = last_check_time.strftime('%Y-%m-%d %H:%M:%S') if last_check_time else time.strftime('%Y-%m-%d %H:%M:%S')
-    msg = (
-        f"🎉 **ТОВАР В НАЛИЧИИ!**\n"
-        f"🏆 Team Spirit Hoodie\n"
-        f"🆔 ID: {PRODUCT_ID}\n"
-        f"🔗 [Ссылка](https://shop.teamspirit.gg/ru/products/{PRODUCT_ID})\n"
-        f"🕒 Обнаружено: {detection_time}"
-    )
+async def send_telegram_message(message_text):
     try:
-        await context.bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode='Markdown')
-        print("✅ Уведомление отправлено!")
+        bot = Bot(token=TELEGRAM_TOKEN)
+        await bot.send_message(chat_id=CHAT_ID, text=message_text, parse_mode='Markdown')
         return True
     except Exception as e:
-        print(f"❌ Ошибка отправки: {e}")
+        print(f"❌ Ошибка отправки в Telegram: {e}")
         return False
 
-# === Команды ===
+def check_product_availability():
+    return asyncio.run(check_with_playwright())
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🚀 Монитор Team Spirit запущен!")
+def send_test_message():
+    test_msg = f"🔄 Тест монитора Team Spirit\nТовар ID: {PRODUCT_ID}\nВремя: {time.strftime('%H:%M:%S')}"
+    return asyncio.run(send_telegram_message(test_msg))
 
-async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    if last_check_time:
-        lc = last_check_time.strftime('%Y-%m-%d %H:%M:%S')
-        if last_check_result is True:
-            status_text = "✅ Доступен"
-        elif last_check_result is False:
-            status_text = "❌ Недоступен"
-        else:
-            status_text = "⚠️ Ошибка при проверке"
-        reply = (
-            f"📊 **Статус мониторинга**\n"
-            f"📦 ID: `{PRODUCT_ID}`\n"
-            f"🔍 Последняя проверка: {lc}\n"
-            f"📈 Результат: {status_text}\n"
-            f"🕗 Сейчас: {now}"
-        )
-    else:
-        reply = "🕗 Мониторинг ещё не начался."
-
-    await update.message.reply_text(reply, parse_mode='Markdown')
-
-# === Фоновая задача ===
-
-async def monitoring_task(context: ContextTypes.DEFAULT_TYPE):
-    global last_check_time, last_check_result
-    print(f"\n{'='*40}\n🔍 Автоматическая проверка...")
-
-    try:
-        available = await safe_check_with_retry(max_retries=3, delay=30)
-        last_check_time = datetime.now()
-        last_check_result = available
-
-        if available is True:
-            print("🎯 ТОВАР ДОСТУПЕН! Отправляем уведомление...")
-            await send_notification(context)  # ← Отправляем ВСЕГДА, если доступен
-        elif available is False:
-            print("⏳ Товар не доступен")
-        else:
-            print("⚠️ Статус неизвестен (проблема с сетью).")
-
-    except Exception as e:
-        print(f"💥 Критическая ошибка в фоновой задаче: {e}")
-        last_check_time = datetime.now()
-        last_check_result = None
-
-# === Запуск ===
-
-async def post_init(application: Application):
-    await application.bot.set_my_commands([
-        BotCommand("start", "Запустить бота"),
-        BotCommand("status", "Проверить статус"),
-    ])
-    await application.bot.send_message(
-        chat_id=CHAT_ID,
-        text=f"🔄 Бот перезапущен\n📦 ID: {PRODUCT_ID}\n🕒 {time.strftime('%Y-%m-%d %H:%M:%S')}",
-        parse_mode='Markdown'
+def send_notification():
+    message = (
+        f"🎉 **ТОВАР ПОЯВИЛСЯ В НАЛИЧИИ!**\n"
+        f"🏆 Team Spirit Hoodie\n"
+        f"🆔 ID: {PRODUCT_ID}\n"
+        f"🔗 [Перейти к товару](https://shop.teamspirit.gg/ru/products/{PRODUCT_ID})\n"
+        f"🕐 {time.strftime('%Y-%m-%d %H:%M:%S')}"
     )
+    return asyncio.run(send_telegram_message(message))
 
 def main():
-    print("🚀 Запуск Telegram-бота с мониторингом...")
-    print(f"📦 ID: {PRODUCT_ID} | 👤 Чат: {CHAT_ID}")
+    print("🚀 МОНИТОРИНГ TEAM SPIRIT")
+    print("=" * 50)
+    print(f"📦 Мониторим товар ID: {PRODUCT_ID}")
+    print(f"👤 Отправляем в чат: {CHAT_ID}")
 
     if PRODUCT_ID != '555':
         print(f"\n⚠️ ВНИМАНИЕ: сейчас мониторится ID={PRODUCT_ID}, а не худи (555)")
 
-    application = Application.builder().token(TELEGRAM_TOKEN).post_init(post_init).build()
+    print("\n🔍 Проверяем Telegram соединение...")
+    if send_test_message():
+        print("✅ Telegram работает корректно!")
+    else:
+        print("⚠️ Проблема с Telegram, но продолжаем мониторинг...")
 
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("status", status))
+    print("\n🎬 НАЧИНАЕМ МОНИТОРИНГ...")
+    notification_sent = False
+    check_count = 0
 
-    # Проверка каждые 10 минут (600 сек), как вы хотели изначально
-    application.job_queue.run_repeating(monitoring_task, interval=600, first=10)
+    try:
+        while True:
+            check_count += 1
+            print(f"\n{'='*40}")
+            print(f"🔍 Проверка #{check_count} - {time.strftime('%Y-%m-%d %H:%M:%S')}")
 
-    print("🤖 Бот запущен. Работает в фоне...")
-    application.run_polling(close_loop=False)
+            is_available = check_product_availability()
+
+            if is_available:
+                if not notification_sent:
+                    print("\n" + "🎉" * 10)
+                    print("🎯 ТОВАР ДОСТУПЕН! ОТПРАВЛЯЕМ УВЕДОМЛЕНИЕ...")
+                    print("🎉" * 10)
+                    if send_notification():
+                        print("✅ Уведомление отправлено!")
+                        notification_sent = True
+                    else:
+                        print("⚠️ Не удалось отправить уведомление")
+                else:
+                    print("📦 Товар всё ещё доступен")
+            else:
+                print("\n⏳ Товар не доступен")
+                notification_sent = False
+
+            print(f"\n⏳ Следующая проверка через 10 минут...")
+            for i in range(10, 0, -1):
+                mins = f"{i} мин" if i > 1 else "1 минуту"
+                print(f"   Ожидание: {mins:10}", end='\r')
+                time.sleep(60)
+            print("   Готово к проверке" + " " * 20)
+
+    except KeyboardInterrupt:
+        print("\n👋 Мониторинг остановлен")
+    except Exception as e:
+        print(f"\n💥 Ошибка: {e}")
 
 if __name__ == '__main__':
-    required = ['TELEGRAM_TOKEN', 'CHAT_ID', 'PRODUCT_ID']
-    missing = [v for v in required if not os.getenv(v)]
-    if missing:
-        print(f"❌ Отсутствуют переменные: {missing}")
+    required_vars = ['TELEGRAM_TOKEN', 'CHAT_ID', 'PRODUCT_ID']
+    missing_vars = [var for var in required_vars if not os.getenv(var)]
+    if missing_vars:
+        print(f"❌ Отсутствуют переменные: {', '.join(missing_vars)}")
         exit(1)
+
+    # Быстрый тест (опционально, можно закомментировать)
+    # quick_test() — убран, чтобы не усложнять
+
     main()
