@@ -9,26 +9,29 @@ from telegram import Bot
 from telegram.error import TelegramError
 from playwright.async_api import async_playwright
 
-# Установка Chromium при старте (если отсутствует)
-def install_chromium():
+# === УСТАНОВКА CHROMIUM ПРИ СТАРТЕ (если отсутствует) ===
+def install_chromium_if_needed():
+    """Проверяет наличие Chromium и устанавливает при необходимости"""
     try:
         from playwright.sync_api import sync_playwright
         with sync_playwright() as p:
-            if not p.chromium.executable_path.exists():
-                raise FileNotFoundError()
+            executable_path = p.chromium.executable_path  # это строка
+            if not os.path.exists(executable_path):
+                raise FileNotFoundError("Chromium executable not found")
     except (ImportError, FileNotFoundError):
-        print("📦 Устанавливаем Chromium для Playwright...")
+        print("📦 Chromium не найден. Устанавливаем...")
         subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=True)
+        print("✅ Chromium установлен!")
 
-install_chromium()
+# Запускаем установку ДО всего остального
+install_chromium_if_needed()
 
-# Загрузка переменных
+# === ОСТАЛЬНОЙ КОД БЕЗ ИЗМЕНЕНИЙ ===
 load_dotenv()
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
 CHAT_ID = os.getenv('CHAT_ID')
 PRODUCT_ID = os.getenv('PRODUCT_ID')
 
-# Проверка CHAT_ID
 try:
     CHAT_ID = int(CHAT_ID)
 except (ValueError, TypeError):
@@ -54,28 +57,12 @@ async def check_with_playwright():
             is_disabled = await main_button.get_attribute('disabled')
             print(f"📌 Текст кнопки: '{button_text}' | disabled: {is_disabled}")
 
-            # Явное отсутствие
             if any(txt in button_text for txt in ["Нет в наличии", "Not available", "Out of stock"]):
                 return False
 
-            # Проверка размеров
             if "Выберите размер" in button_text or "Select size" in button_text:
-                sizes_container = (
-                    await page.query_selector('div.purchase-card__sizes') or
-                    await page.query_selector('div[role="group"]')
-                )
-                if sizes_container:
-                    size_buttons = await sizes_container.query_selector_all('button')
-                    for button in size_buttons:
-                        is_disabled = await button.get_attribute('disabled')
-                        has_data_disabled = await button.get_attribute('data-disabled')
-                        if not is_disabled and not has_data_disabled:
-                            return True
-                    return False
-                else:
-                    return False
+                return await check_sizes_availability(page)
 
-            # Обычная доступность
             return not is_disabled
 
         except Exception as e:
@@ -84,13 +71,34 @@ async def check_with_playwright():
         finally:
             await browser.close()
 
+async def check_sizes_availability(page):
+    try:
+        sizes_container = (
+            await page.query_selector('div.purchase-card__sizes') or
+            await page.query_selector('div[role="group"]')
+        )
+        if sizes_container:
+            size_buttons = await sizes_container.query_selector_all('button')
+            available_sizes = []
+            for button in size_buttons:
+                size_text = (await button.text_content()).strip()
+                is_disabled = await button.get_attribute('disabled')
+                has_data_disabled = await button.get_attribute('data-disabled')
+                if not is_disabled and not has_data_disabled and size_text:
+                    available_sizes.append(size_text)
+            return len(available_sizes) > 0
+        return False
+    except Exception as e:
+        print(f"⚠️ Ошибка при проверке размеров: {e}")
+        return False
+
 async def send_telegram_message(message_text):
     try:
         bot = Bot(token=TELEGRAM_TOKEN)
         await bot.send_message(chat_id=CHAT_ID, text=message_text, parse_mode='Markdown')
         return True
     except Exception as e:
-        print(f"❌ Ошибка отправки в Telegram: {e}")
+        print(f"❌ Ошибка отправки: {e}")
         return False
 
 def check_product_availability():
@@ -172,7 +180,5 @@ if __name__ == '__main__':
         print(f"❌ Отсутствуют переменные: {', '.join(missing_vars)}")
         exit(1)
 
-    # Быстрый тест (опционально, можно закомментировать)
-    # quick_test() — убран, чтобы не усложнять
-
+    # УБРАНО: quick_test() и input() — они не работают в Railway!
     main()
