@@ -1,25 +1,44 @@
-# main.py
+# main.py (версия для Railway)
 import os
 import time
 import asyncio
+import sys
+import subprocess
 from dotenv import load_dotenv
 from telegram import Bot
-from telegram.error import TelegramError
 from playwright.async_api import async_playwright
 
+# === УСТАНОВКА CHROMIUM ПРИ СТАРТЕ ===
+def install_chromium():
+    """Устанавливает Chromium, если отсутствует"""
+    try:
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as p:
+            path = p.chromium.executable_path
+            if not os.path.exists(path):
+                raise FileNotFoundError()
+    except (ImportError, FileNotFoundError):
+        print("📦 Устанавливаем Chromium...")
+        subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=True)
+        print("✅ Chromium готов!")
+
+# Запускаем установку ДО всего остального
+install_chromium()
+
+# === ЗАГРУЗКА ПЕРЕМЕННЫХ ===
 load_dotenv()
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
 CHAT_ID = os.getenv('CHAT_ID')
-PRODUCT_ID = os.getenv('PRODUCT_ID')
+PRODUCT_ID = os.getenv('PRODUCT_ID') or '555'  # fallback на 555
 
 try:
     CHAT_ID = int(CHAT_ID)
 except (ValueError, TypeError):
-    print("❌ Ошибка: CHAT_ID должен быть числом!")
+    print("❌ CHAT_ID должен быть числом!")
     exit(1)
 
+# === ФУНКЦИИ ПРОВЕРКИ ===
 async def check_with_playwright():
-    """Проверяет наличие товара через Playwright с флагами для Railway"""
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=True,
@@ -34,145 +53,109 @@ async def check_with_playwright():
         page = await browser.new_page()
         try:
             url = f"https://shop.teamspirit.gg/ru/products/{PRODUCT_ID}"
-            print(f"🌐 Открываем страницу: {url}")
+            print(f"🌐 Открываем: {url}")
             await page.goto(url, wait_until='networkidle', timeout=30000)
             await page.wait_for_timeout(2000)
 
             main_button = await page.query_selector('button.btn-lg')
             if not main_button:
-                print("⚠️ Кнопка 'btn-lg' не найдена")
                 return False
 
             button_text = (await main_button.text_content()).strip()
             is_disabled = await main_button.get_attribute('disabled')
-            print(f"📌 Текст кнопки: '{button_text}' | disabled: {is_disabled}")
 
             # Явное отсутствие
-            if any(txt in button_text for txt in ["Нет в наличии", "Not available", "Out of stock"]):
+            if any(t in button_text for t in ["Нет в наличии", "Not available", "Out of stock"]):
                 return False
 
             # Проверка размеров
             if "Выберите размер" in button_text or "Select size" in button_text:
-                return await check_sizes_availability(page)
+                sizes_container = (
+                    await page.query_selector('div.purchase-card__sizes') or
+                    await page.query_selector('div[role="group"]')
+                )
+                if sizes_container:
+                    buttons = await sizes_container.query_selector_all('button')
+                    for btn in buttons:
+                        if not await btn.get_attribute('disabled') and not await btn.get_attribute('data-disabled'):
+                            return True
+                    return False
+                return False
 
-            # Обычная доступность
             return not is_disabled
-
         except Exception as e:
-            print(f"⚠️ Ошибка Playwright: {e}")
+            print(f"⚠️ Ошибка: {e}")
             return False
         finally:
             await browser.close()
 
-async def check_sizes_availability(page):
-    """Проверяет доступные размеры"""
-    try:
-        sizes_container = (
-            await page.query_selector('div.purchase-card__sizes') or
-            await page.query_selector('div[role="group"]')
-        )
-        if sizes_container:
-            size_buttons = await sizes_container.query_selector_all('button')
-            available_sizes = []
-            for button in size_buttons:
-                size_text = (await button.text_content()).strip()
-                is_disabled = await button.get_attribute('disabled')
-                has_data_disabled = await button.get_attribute('data-disabled')
-                if not is_disabled and not has_data_disabled and size_text:
-                    available_sizes.append(size_text)
-            return len(available_sizes) > 0
-        return False
-    except Exception as e:
-        print(f"⚠️ Ошибка при проверке размеров: {e}")
-        return False
-
-async def send_telegram_message(message_text):
-    """Отправляет сообщение в Telegram"""
+async def send_telegram_message(text):
     try:
         bot = Bot(token=TELEGRAM_TOKEN)
-        await bot.send_message(chat_id=CHAT_ID, text=message_text, parse_mode='Markdown')
+        await bot.send_message(chat_id=CHAT_ID, text=text, parse_mode='Markdown')
         return True
     except Exception as e:
-        print(f"❌ Ошибка отправки: {e}")
+        print(f"❌ Telegram ошибка: {e}")
         return False
 
 def check_product_availability():
     return asyncio.run(check_with_playwright())
 
 def send_test_message():
-    test_msg = f"🔄 Тест монитора Team Spirit\nТовар ID: {PRODUCT_ID}\nВремя: {time.strftime('%H:%M:%S')}"
-    return asyncio.run(send_telegram_message(test_msg))
+    msg = f"🔄 Монитор запущен\nID: {PRODUCT_ID}\n🕒 {time.strftime('%H:%M:%S')}"
+    return asyncio.run(send_telegram_message(msg))
 
 def send_notification():
-    message = (
-        f"🎉 **ТОВАР ПОЯВИЛСЯ В НАЛИЧИИ!**\n"
-        f"🏆 Team Spirit Hoodie\n"
+    msg = (
+        f"🎉 **ТОВАР В НАЛИЧИИ!**\n"
         f"🆔 ID: {PRODUCT_ID}\n"
-        f"🔗 [Перейти к товару](https://shop.teamspirit.gg/ru/products/{PRODUCT_ID})\n"
+        f"🔗 [Ссылка](https://shop.teamspirit.gg/ru/products/{PRODUCT_ID})\n"
         f"🕐 {time.strftime('%Y-%m-%d %H:%M:%S')}"
     )
-    return asyncio.run(send_telegram_message(message))
+    return asyncio.run(send_telegram_message(msg))
 
+# === ОСНОВНОЙ ЦИКЛ ===
 def main():
     print("🚀 МОНИТОРИНГ TEAM SPIRIT")
-    print("=" * 50)
-    print(f"📦 Мониторим товар ID: {PRODUCT_ID}")
-    print(f"👤 Отправляем в чат: {CHAT_ID}")
+    print(f"📦 ID: {PRODUCT_ID} | 👤 Чат: {CHAT_ID}")
 
     if PRODUCT_ID != '555':
-        print(f"\n⚠️ ВНИМАНИЕ: сейчас мониторится ID={PRODUCT_ID}, а не худи (555)")
+        print(f"\n⚠️ ВНИМАНИЕ: мониторится ID={PRODUCT_ID}, а не худи (555)")
 
-    print("\n🔍 Проверяем Telegram соединение...")
     if send_test_message():
-        print("✅ Telegram работает корректно!")
+        print("✅ Telegram работает")
     else:
-        print("⚠️ Проблема с Telegram, но продолжаем мониторинг...")
+        print("⚠️ Проблема с Telegram")
 
-    print("\n🎬 НАЧИНАЕМ МОНИТОРИНГ...")
-    notification_sent = False
-    check_count = 0
+    print("\n🎬 Начинаем мониторинг...")
+    notified = False
+    check = 0
 
-    try:
-        while True:
-            check_count += 1
-            print(f"\n{'='*40}")
-            print(f"🔍 Проверка #{check_count} - {time.strftime('%Y-%m-%d %H:%M:%S')}")
+    while True:
+        check += 1
+        print(f"\n{'='*40}\n🔍 Проверка #{check} - {time.strftime('%Y-%m-%d %H:%M:%S')}")
 
-            is_available = check_product_availability()
+        available = check_product_availability()
 
-            if is_available:
-                if not notification_sent:
-                    print("\n" + "🎉" * 10)
-                    print("🎯 ТОВАР ДОСТУПЕН! ОТПРАВЛЯЕМ УВЕДОМЛЕНИЕ...")
-                    print("🎉" * 10)
-                    if send_notification():
-                        print("✅ Уведомление отправлено!")
-                        notification_sent = True
-                    else:
-                        print("⚠️ Не удалось отправить уведомление")
-                else:
-                    print("📦 Товар всё ещё доступен")
+        if available:
+            if not notified:
+                print("🎯 ТОВАР ДОСТУПЕН! Отправляем уведомление...")
+                if send_notification():
+                    print("✅ Уведомление отправлено!")
+                    notified = True
             else:
-                print("\n⏳ Товар не доступен")
-                notification_sent = False
+                print("📦 Товар всё ещё доступен")
+        else:
+            print("⏳ Товар недоступен")
+            notified = False
 
-            print(f"\n⏳ Следующая проверка через 10 минут...")
-            for i in range(10, 0, -1):
-                mins = f"{i} мин" if i > 1 else "1 минуту"
-                print(f"   Ожидание: {mins:10}", end='\r')
-                time.sleep(60)
-            print("   Готово к проверке" + " " * 20)
-
-    except KeyboardInterrupt:
-        print("\n👋 Мониторинг остановлен")
-    except Exception as e:
-        print(f"\n💥 Ошибка: {e}")
+        print("\n⏳ Ждём 10 минут...")
+        time.sleep(600)  # 10 минут
 
 if __name__ == '__main__':
-    required_vars = ['TELEGRAM_TOKEN', 'CHAT_ID', 'PRODUCT_ID']
-    missing_vars = [var for var in required_vars if not os.getenv(var)]
-    if missing_vars:
-        print(f"❌ Отсутствуют переменные: {', '.join(missing_vars)}")
+    required = ['TELEGRAM_TOKEN', 'CHAT_ID']
+    missing = [v for v in required if not os.getenv(v)]
+    if missing:
+        print(f"❌ Отсутствуют переменные: {', '.join(missing)}")
         exit(1)
-
     main()
